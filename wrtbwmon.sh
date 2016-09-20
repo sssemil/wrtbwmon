@@ -1,8 +1,10 @@
-#!/bin/sh
+#!/system/bin/sh
 #
 # Traffic logging tool for OpenWRT-based routers
 #
 # Created by Emmanuel Brucy (e.brucy AT qut.edu.au)
+# Updated by Peter Bailey (peter.eldridge.bailey@gmail.com)
+# Updated by Emil Suleymanov (suleymanovemil8@gmail.com) for Android OS
 #
 # Based on work from Fredrik Erlandsson (erlis AT linux.nu)
 # Based on traff_graph script by twist - http://wiki.openwrt.org/RrdTrafficWatch
@@ -21,179 +23,146 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-LAN_IFACE=$(nvram get lan_ifname)
+[ -p /cache/wrtbwmon.pipe ] || ./busybox mkfifo /cache/wrtbwmon.pipe
+
+trap "rm -f /cache/*$$.tmp; kill $$" INT
+baseDir=.
+dataDir=.
+
+chains='INPUT OUTPUT FORWARD'
+DEBUG=
+interfaces='wlan0'
+DB=$2
+mode=
+
+header="#mac,ip,iface,in,out,total,first_date,last_date"
+
 
 lock()
 {
-	while [ -f /tmp/wrtbwmon.lock ]; do
-		if [ ! -d /proc/$(cat /tmp/wrtbwmon.lock) ]; then
-			echo "WARNING : Lockfile detected but process $(cat /tmp/wrtbwmon.lock) does not exist !"
-			rm -f /tmp/wrtbwmon.lock
-		fi
+    attempts=0
+    while [ $attempts -lt 10 ]; do
+	mkdir /cache/wrtbwmon.lock && break
+	attempts=$((attempts+1))
+	if [ -d /cache/wrtbwmon.lock ]; then
+	    if [ ! -d /proc/$(cat /cache/wrtbwmon.lock/pid) ]; then
+		echo "WARNING: Lockfile detected but process $(cat /cache/wrtbwmon.lock/pid) does not exist !"
+		rm -rf /cache/wrtbwmon.lock
+	    else
 		sleep 1
-	done
-	echo $$ > /tmp/wrtbwmon.lock
+	    fi
+	fi
+    done
+    #[[ -n "$DEBUG" ]] && echo $$ "got lock after $attempts attempts"
+    trap '' INT
 }
 
 unlock()
 {
-	rm -f /tmp/wrtbwmon.lock
+    rm -rf /cache/wrtbwmon.lock
+    #[[ -n "$DEBUG" ]] && echo $$ "released lock"
+    trap "rm -f /cache/*$$.tmp; kill $$" INT
 }
 
-case ${1} in
+# chain
+newChain()
+{
+    chain=$1
 
-"setup" )
-
-	#Create the RRDIPT CHAIN (it doesn't matter if it already exists).
-	iptables -N RRDIPT 2> /dev/null
-
-	#Add the RRDIPT CHAIN to the FORWARD chain (if non existing).
-	iptables -L FORWARD --line-numbers -n | grep "RRDIPT" | grep "1" > /dev/null
-	if [ $? -ne 0 ]; then
-		iptables -L FORWARD -n | grep "RRDIPT" > /dev/null
-		if [ $? -eq 0 ]; then
-			echo "DEBUG : iptables chain misplaced, recreating it..."
-			iptables -D FORWARD -j RRDIPT
-		fi
-		iptables -I FORWARD -j RRDIPT
+    #Create the RRDIPT_$chain chain (it doesn't matter if it already exists).
+    ./iptables -t mangle -N RRDIPT_$chain 2> /dev/null
+    
+    #Add the RRDIPT_$chain CHAIN to the $chain chain (if non existing).
+    ./iptables -t mangle -L $chain --line-numbers -n | grep "RRDIPT_$chain" > /dev/null
+    if [ $? -ne 0 ]; then
+	./iptables -t mangle -L $chain -n | grep "RRDIPT_$chain" > /dev/null
+	if [ $? -eq 0 ]; then
+	    [ -n "$DEBUG" ] && echo "DEBUG: ./iptables chain misplaced, recreating it..."
+	    ./iptables -t mangle -D $chain -j RRDIPT_$chain
 	fi
+	./iptables -t mangle -I $chain -j RRDIPT_$chain
+    fi
+}
 
-	#For each host in the ARP table
-	grep ${LAN_IFACE} /proc/net/arp | while read IP TYPE FLAGS MAC MASK IFACE
-	do
-		#Add iptable rules (if non existing).
-		iptables -nL RRDIPT | grep "${IP} " > /dev/null
-		if [ $? -ne 0 ]; then
-			iptables -I RRDIPT -d ${IP} -j RETURN
-			iptables -I RRDIPT -s ${IP} -j RETURN
-		fi
-	done	
-	;;
-	
-"update" )
-	[ -z "${2}" ] && echo "ERROR : Missing argument 2" && exit 1
-	
-	# Uncomment this line if you want to abort if database not found
-	# [ -f "${2}" ] || exit 1
+# chain tun
+newRuleIF()
+{
+    chain=$1
+    IF=$2
+    
+    ./iptables -t mangle -nvL RRDIPT_$chain | grep " $IF " > /dev/null
+    if [ "$?" -ne 0 ]; then
+	if [ "$chain" = "OUTPUT" ]; then
+	    ./iptables -t mangle -A RRDIPT_$chain -o $IF -j RETURN
+	elif [ "$chain" = "INPUT" ]; then
+	    ./iptables -t mangle -A RRDIPT_$chain -i $IF -j RETURN
+	fi
+    elif [ -n "$DEBUG" ]; then
+	echo "DEBUG: table mangle chain $chain rule $IF already exists?"
+    fi
+}
 
-	lock
+update()
+{
+    [ -z "$DB" ] && echo "ERROR: Missing argument 2 (database file)" && exit 1	
+    [ ! -f "$DB" ] && echo $header > "$DB"
+    [ ! -w "$DB" ] && echo "ERROR: $DB not writable" && exit 1
 
-	#Read and reset counters
-	iptables -L RRDIPT -vnxZ -t filter > /tmp/traffic_$$.tmp
+    lock
 
-	grep -v "0x0" /proc/net/arp  | while read IP TYPE FLAGS MAC MASK IFACE
-	do
-		#Add new data to the graph. Count in Kbs to deal with 16 bits signed values (up to 2G only)
-		#Have to use temporary files because of crappy busybox shell
-		echo 0 > /tmp/in_$$.tmp
-		echo 0 > /tmp/out_$$.tmp
-		grep ${IP} /tmp/traffic_$$.tmp | while read PKTS BYTES TARGET PROT OPT IFIN IFOUT SRC DST
-		do
-			[ "${DST}" = "${IP}" ] && echo $((${BYTES}/1000)) > /tmp/in_$$.tmp
-			[ "${SRC}" = "${IP}" ] && echo $((${BYTES}/1000)) > /tmp/out_$$.tmp
-		done
-		IN=$(cat /tmp/in_$$.tmp)
-		OUT=$(cat /tmp/out_$$.tmp)
-		
-		if [ ${IN} -gt 0 -o ${OUT} -gt 0 ];  then
-			echo "DEBUG : New traffic for ${MAC} since last update : ${IN}k:${OUT}k"
-		
-			LINE=$(grep ${MAC} ${2})
-			if [ -z "${LINE}" ]; then
-				echo "DEBUG : ${MAC} is a new host !"
-				PEAKUSAGE_IN=0
-				PEAKUSAGE_OUT=0
-				OFFPEAKUSAGE_IN=0
-				OFFPEAKUSAGE_OUT=0
-			else
-				PEAKUSAGE_IN=$(echo ${LINE} | cut -f3 -s -d, )
-				PEAKUSAGE_OUT=$(echo ${LINE} | cut -f4 -s -d, )
-				OFFPEAKUSAGE_IN=$(echo ${LINE} | cut -f5 -s -d, )
-				OFFPEAKUSAGE_OUT=$(echo ${LINE} | cut -f6 -s -d, )
-			fi
-			
-			if [ "${3}" = "offpeak" ]; then
-				OFFPEAKUSAGE_IN=$((${OFFPEAKUSAGE_IN}+${IN}))
-				OFFPEAKUSAGE_OUT=$((${OFFPEAKUSAGE_OUT}+${OUT}))
-			else
-				PEAKUSAGE_IN=$((${PEAKUSAGE_IN}+${IN}))
-				PEAKUSAGE_OUT=$((${PEAKUSAGE_OUT}+${OUT}))
-			fi
+    ./iptables -nvxL -t mangle -Z > /cache/iptables_$$.tmp
 
-			grep -v "${MAC}" ${2} > /tmp/db_$$.tmp
-			mv /tmp/db_$$.tmp ${2}
-			echo ${MAC},${IP},${PEAKUSAGE_IN},${PEAKUSAGE_OUT},${OFFPEAKUSAGE_IN},${OFFPEAKUSAGE_OUT},$(date "+%s") >> ${2}
-		fi
-	done
-	
-	#Free some memory
-	rm -f /tmp/*_$$.tmp
-	unlock
-	;;
-	
-"publish" )
+    ./busybox awk -v mode="$mode" -v interfaces="$interfaces" -f readDB.awk \
+	$DB \
+	/proc/net/arp \
+	/cache/iptables_$$.tmp
+    
+    unlock
+}
 
-	[ -z "${2}" ] && echo "ERROR : Missing argument 2" && exit 1
-	[ -z "${3}" ] && echo "ERROR : Missing argument 3" && exit 1
-	
-	USERSFILE="/etc/dnsmasq.conf"
-	[ -f "${USERSFILE}" ] || USERSFILE="/tmp/dnsmasq.conf"
-	[ -z "${4}" ] || USERSFILE=${4}
-	[ -f "${USERSFILE}" ] || USERSFILE="/dev/null"
+############################################################
+cd $3
 
-        # create HTML page
-        echo "<html><head><title>Traffic</title><script type=\"text/javascript\">" > ${3}
-        echo "function getSize(size) {" >> ${3}
-        echo "var prefix=new Array(\"\",\"k\",\"M\",\"G\",\"T\",\"P\",\"E\",\"Z\");var base=1000;" >> ${3}
-        echo "var pos=0;while(size>base){size/=base;pos++;}if(pos>2)precision=1000;else precision=1;" >> ${3}
-        echo "return(Math.round(size*precision)/precision)+' '+prefix[pos];}" >> ${3}
-        echo "</script></head><body><h1>Total Usage :</h1>" >> ${3}
-        echo "<table border="1"><tr bgcolor=silver><th>User</th><th>Peak download</th><th>Peak upload</th><th>Offpeak download</th><th>Offpeak upload</th><th>Last seen</th></tr>" >> ${3}
-        echo "<script type=\"text/javascript\">" >> ${3}
-
-        echo "var values = new Array(" >> ${3}
-        lock
-        cat ${2} | while IFS=, read MAC IP PEAKUSAGE_IN PEAKUSAGE_OUT OFFPEAKUSAGE_IN OFFPEAKUSAGE_OUT LASTSEEN
-        do
-                echo "new Array(" >> ${3}
-                USER=$(grep "${MAC}" "${USERSFILE}" | cut -f2 -s -d, )
-                [ -z "$USER" ] && USER=${MAC}
-                echo "\"${USER}\",${PEAKUSAGE_IN}000,${PEAKUSAGE_OUT}000,${OFFPEAKUSAGE_IN}000,${OFFPEAKUSAGE_OUT}000,${LASTSEEN}000)," >> ${3}
-        done
-        unlock
-        echo "0);" >> ${3}
-
-	echo "var dv = new Array();for (i=0;i<values.length-1;i++){found=0;for(j=i+1;j<values.length-1;j++){if(values[i][0]==values[j][0]){" >> ${3}
-	echo "values[j][1]+=values[i][1];values[j][2]+=values[i][2];values[j][3]+=values[i][3];values[j][4]+=values[i][4];values[j][5]=Math.max(values[i][5],values[j][5]);found=1;break;" >> ${3}
-	echo "}}if(found==0){dv.push(values[i]);}}dv.sort(function(a,b){return a[1]-b[1]});" >> ${3}
-
-        echo "for (i=0; i < dv.length; i++) {document.write(\"<tr><td>\");" >> ${3}
-        echo "document.write(dv[i][0]);document.write(\"</td><td>\");" >> ${3}
-        echo "document.write(getSize(dv[i][1]));document.write(\"</td><td>\");" >> ${3}
-        echo "document.write(getSize(dv[i][2]));document.write(\"</td><td>\");" >> ${3}
-        echo "document.write(getSize(dv[i][3]));document.write(\"</td><td>\");" >> ${3}
-        echo "document.write(getSize(dv[i][4]));document.write(\"</td><td>\");" >> ${3}
-        echo "document.write(new Date(dv[i][5]));document.write(\"</td></tr>\");" >> ${3}
-        echo "}</script></table>" >> ${3}
-        echo "<br /><small>This page was generated on `date`</small>" 2>&1 >> ${3}
-        echo "</body></html>" >> ${3}
-
-        #Free some memory
-        rm -f /tmp/*_$$.tmp
-        ;;
-
-*)
-	echo "Usage : $0 {setup|update|publish} [options...]"
-	echo "Options : "
-	echo "   $0 setup"
-	echo "   $0 update database_file [offpeak]"
-	echo "   $0 publish database_file path_of_html_report [user_file]"
-	echo "Examples : "
-	echo "   $0 setup"
-	echo "   $0 update /tmp/usage.db offpeak"
-	echo "   $0 publish /tmp/usage.db /www/user/usage.htm /jffs/users.txt"
-	echo "Note : [user_file] is an optional file to match users with their MAC address"
-	echo "       Its format is : 00:MA:CA:DD:RE:SS,username , with one entry per line"
+case $1 in
+    "update" )
+	update
+	rm -f /cache/*$$.tmp
 	exit
+	;;
+    
+    "setup" )
+	for chain in $chains; do
+	    newChain $chain
+	done
+
+	# track local data
+	for chain in INPUT OUTPUT; do
+	    for interface in $interfaces; do
+		[ -n "$interface" ] && [ -e "/sys/class/net/$interface" ] && newRuleIF $chain $interface
+	    done
+	done
+
+	# this will add rules for hosts in arp table
+	update
+
+	rm -f /cache/*$$.tmp
+        cat $DB
+	;;
+
+    "remove" )
+	./iptables-save | grep -v RRDIPT | ./iptables-restore
+	;;
+    
+    *)
+	echo "Usage: $0 {setup|update|publish|remove} [options...]"
+	echo "Options: "
+	echo "   $0 setup database_file"
+	echo "   $0 update database_file"
+	echo "Examples: "
+	echo "   $0 setup /cache/usage.db"
+	echo "   $0 update /cache/usage.db"
+	echo "   $0 remove"
+	echo "Note: [user_file] is an optional file to match users with their MAC address"
+	echo "       Its format is: 00:MA:CA:DD:RE:SS,username , with one entry per line"
 	;;
 esac
